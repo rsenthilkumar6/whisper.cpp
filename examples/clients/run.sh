@@ -6,7 +6,7 @@ if [ ! -d ".venv" ]; then
     python3 -m venv .venv
     # Use the venv's pip directly
     .venv/bin/pip install --upgrade pip
-    .venv/bin/pip install sounddevice websockets pynput
+    .venv/bin/pip install sounddevice websockets pynput rich numpy
 else
     echo "✅ Virtual environment already exists."
 fi
