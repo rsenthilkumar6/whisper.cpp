@@ -100,3 +100,57 @@ To conserve context space, load these resources as needed:
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [Existing issues](https://github.com/ggml-org/whisper.cpp/issues) and [Existing PRs](https://github.com/ggml-org/whisper.cpp/pulls) - always search here first
+
+---
+
+## This Fork: Streaming Speech-to-Text (rsenthilkumar6)
+
+This fork adds **real-time streaming transcription over WebSocket**, on top of the
+upstream HTTP `whisper-server`. It is intended for personal use (Apple Silicon / M5 Max).
+
+### What was added
+
+- **`examples/server/websocket-stream.cpp`** — a self-contained RFC6455 WebSocket
+  server linked against `libwhisper`. It receives raw `int16` PCM (16 kHz, mono) audio
+  frames and streams back incremental transcripts as JSON `{"text": "...", "is_final": bool}`.
+  "Streaming" is implemented by re-transcribing a capped (30 s) rolling audio buffer
+  whenever ≥1 s of new audio arrives. A global mutex serializes `whisper_full` across
+  connections.
+- **`examples/server/CMakeLists.txt`** — new `whisper-websocket-stream` target
+  (links `common json_cpp whisper pthread`).
+- **`examples/clients/streaming_client.py`** — Python WebSocket dictation client
+  (sounddevice + `websockets` + pynput). F1 to start/stop; inserts text at the cursor
+  via AppleScript. Sends `{"config": {...}}`, binary audio, and `{"eof": true}`.
+- **`examples/clients/run.sh`** — sets up the venv (`sounddevice websockets pynput`)
+  and launches the streaming client.
+- **`server.sh`** — launches `./build/bin/whisper-websocket-stream`.
+- **`build.sh`** — model step now auto-downloads pre-converted GGML (falls back to
+  source conversion), skips present models, and skips Core ML for missing GGML.
+
+### WebSocket protocol (server <-> client)
+
+```
+client -> server : {"config": {"language": "en", "task": "transcribe", "translate": false}}
+client -> server : <binary int16 PCM, 16 kHz, mono>  (repeated)
+client -> server : {"eof": true}                     (optional, request final)
+server -> client : {"text": "<transcript>", "is_final": false}   (repeated, live)
+server -> client : {"text": "<transcript>", "is_final": true}    (on eof / disconnect)
+server -> client : {"error": "..."}
+```
+
+### Build & run
+
+```bash
+./build.sh            # builds examples (incl. whisper-websocket-stream) + models
+./server.sh           # starts the websocket stream server on :9002
+./examples/clients/run.sh   # F1 to start/stop dictation
+```
+
+> Note: Whisper is not natively streaming; the live transcript is produced by
+> re-running inference on a rolling buffer. This is simple and works for dictation,
+> but has O(n) cost growth bounded by the 30 s cap.
+
+### Disclosure
+
+This fork's streaming feature was developed with AI assistance in an assistive capacity.
+The contributor is responsible for understanding, maintaining, and debugging it.
