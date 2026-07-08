@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <ctime>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -205,11 +206,17 @@ static bool ws_handshake(int fd) {
         accept.push_back(i + 2 < digest.size() ? b64[v & 0x3F] : '=');
     }
 
+    auto now = std::time(nullptr);
+    char date_buf[64];
+    std::strftime(date_buf, sizeof(date_buf), "%a, %d %b %Y %H:%M:%S GMT", std::gmtime(&now));
+
     std::string resp =
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
-        "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+        "Sec-WebSocket-Accept: " + accept + "\r\n"
+        "Date: " + date_buf + "\r\n"
+        "\r\n";
     size_t written = 0;
     while (written < resp.size()) {
         ssize_t n = write(fd, resp.data() + written, resp.size() - written);
