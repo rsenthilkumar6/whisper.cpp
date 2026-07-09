@@ -24,6 +24,10 @@ class WhisperClient {
   Socket? _socket;
   StreamSubscription? _subscription;
   bool _disposed = false;
+  bool _reconnecting = false;
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectAttempts = 5;
+  static const Duration _baseReconnectDelay = Duration(seconds: 2);
   final StreamController<String> _messageController =
       StreamController<String>.broadcast();
 
@@ -40,6 +44,13 @@ class WhisperClient {
   bool get isConnected => _socket != null && !_disposed;
 
   Future<void> connect(ServerConfig config) async {
+    if (_disposed) return;
+    _reconnecting = false;
+    _reconnectAttempts = 0;
+    await _doConnect(config);
+  }
+
+  Future<void> _doConnect(ServerConfig config) async {
     final host = config.host;
     final port = config.port;
 
@@ -50,13 +61,13 @@ class WhisperClient {
         timeout: const Duration(seconds: 8),
       );
     } on SocketException catch (e) {
-      onError('Cannot reach $host:$port. ${e.message}');
+      _handleConnectionError('Cannot reach $host:$port. ${e.message}');
       return;
     } on TimeoutException {
-      onError('Connection timed out. Is whisper-websocket-stream running at $host:$port?');
+      _handleConnectionError('Connection timed out. Is whisper-websocket-stream running at $host:$port?');
       return;
     } on Object catch (e) {
-      onError('Failed to connect to $host:$port. $e');
+      _handleConnectionError('Failed to connect to $host:$port. $e');
       return;
     }
 
@@ -93,21 +104,36 @@ class WhisperClient {
       },
       cancelOnError: false,
     );
+
+    // Start ping timer to keep connection alive
+    _pingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
+      if (_disposed) return;
+      _sendPing();
+    });
   }
 
-  String _encodeBase64(List<int> bytes) {
-    const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-    final result = StringBuffer();
-    for (int i = 0; i < bytes.length; i += 3) {
-      int v = bytes[i] << 16;
-      if (i + 1 < bytes.length) v |= bytes[i + 1] << 8;
-      if (i + 2 < bytes.length) v |= bytes[i + 2];
-      result.write(chars[(v >> 18) & 0x3F]);
-      result.write(chars[(v >> 12) & 0x3F]);
-      result.write(i + 1 < bytes.length ? chars[(v >> 6) & 0x3F] : '=');
-      result.write(i + 2 < bytes.length ? chars[v & 0x3F] : '=');
+  Timer? _pingTimer;
+
+  void _handleConnectionError(String message) {
+    if (_disposed) return;
+    if (!_reconnecting && _reconnectAttempts < _maxReconnectAttempts) {
+      _scheduleReconnect(message);
+    } else {
+      onError(message);
     }
-    return result.toString();
+  }
+
+  void _scheduleReconnect(String lastError) {
+    _reconnecting = true;
+    final delay = _baseReconnectDelay * (1 << _reconnectAttempts);
+    _reconnectAttempts++;
+    onError('Connection lost: $lastError. Reconnecting in ${delay.inSeconds}s... (attempt $_reconnectAttempts/$_maxReconnectAttempts)');
+    Future.delayed(delay, () {
+      if (!_disposed) {
+        _reconnecting = false;
+        // Config will be reloaded by caller via start()
+      }
+    });
   }
 
   Future<bool> _doHandshake(String host, int port) async {
@@ -124,42 +150,45 @@ class WhisperClient {
       ..write('\r\n');
 
     _socket!.write(request.toString());
+    await _socket!.flush();
 
-    final completer = Completer<bool>();
     final buffer = <int>[];
-    final sub = _socket!.listen(
-      (data) {
+    try {
+      await _socket!.takeWhile((data) {
         buffer.addAll(data);
         final str = utf8.decode(buffer, allowMalformed: true);
-        if (str.contains('\r\n\r\n')) {
-          completer.complete(str.startsWith('HTTP/1.1 101'));
-        }
-      },
-      onError: (Object e) {
-        if (!completer.isCompleted) completer.complete(false);
-      },
-      onDone: () {
-        if (!completer.isCompleted) completer.complete(false);
-      },
-    );
-    _socket!.setSubscriptionHandler(() {});
+        return !str.contains('\r\n\r\n');
+      }).drain().timeout(const Duration(seconds: 8));
+    } on TimeoutException {
+      return false;
+    } on Object {
+      return false;
+    }
 
-    final success = await completer.future.timeout(const Duration(seconds: 8));
-    await sub.cancel();
-    _socket!.setReadHandler(true);
+    final str = utf8.decode(buffer, allowMalformed: true);
+    final success = str.contains('101 Switching Protocols');
+    final headerEnd = str.indexOf('\r\n\r\n') + 4;
+    if (headerEnd < str.length) {
+      _frameBuffer.addAll(utf8.encode(str.substring(headerEnd)));
+    }
     return success;
   }
 
   void _onRawData(Uint8List data) {
+    if (_disposed) return;
     _frameBuffer.addAll(data);
     _processFrames();
   }
 
   final List<int> _frameBuffer = [];
+  bool _processingFrames = false;
 
   void _processFrames() {
+    if (_processingFrames || _disposed) return;
+    _processingFrames = true;
+
     while (true) {
-      if (_frameBuffer.length < 2) return;
+      if (_frameBuffer.length < 2) break;
 
       final opcode = _frameBuffer[0] & 0x0F;
       final masked = (_frameBuffer[1] & 0x80) != 0;
@@ -167,36 +196,45 @@ class WhisperClient {
       int idx = 2;
 
       if (len == 126) {
-        if (_frameBuffer.length < idx + 2) return;
+        if (_frameBuffer.length < idx + 2) break;
         len = (_frameBuffer[idx] << 8) | _frameBuffer[idx + 1];
         idx += 2;
       } else if (len == 127) {
-        if (_frameBuffer.length < idx + 8) return;
+        if (_frameBuffer.length < idx + 8) break;
         len = 0;
-        for (int i = 0; i < 8; i++) len = (len << 8) | _frameBuffer[idx + i];
+        for (int i = 0; i < 8; i++) {
+          len = (len << 8) | _frameBuffer[idx + i];
+        }
         idx += 8;
       }
 
-      if (masked) idx += 4;
-      if (_frameBuffer.length < idx + len) return;
+      if (len > 16 * 1024 * 1024) { // 16MB max frame
+        onError('Frame too large: $len bytes');
+        _frameBuffer.clear();
+        break;
+      }
 
-      if (opcode == 0x0 || opcode == 0x1 || opcode == 0x2) {
+      if (masked) idx += 4;
+      if (_frameBuffer.length < idx + len) break;
+
+      if (opcode == 0x8) { // close
+        _frameBuffer.removeRange(0, idx + len);
+        onClosed();
+        break;
+      } else if (opcode == 0x9) { // ping -> pong
+        final pong = Uint8List.fromList([0x8A, 0x00]);
+        _socket?.add(pong);
+      } else if (opcode == 0x1 || opcode == 0x2 || opcode == 0x0) {
         final payload = _frameBuffer.sublist(idx, idx + len);
         if (opcode == 0x1) {
           _messageController.add(utf8.decode(payload));
         }
-      } else if (opcode == 0x8) {
-        _frameBuffer.clear();
-        onClosed();
-        return;
-      } else if (opcode == 0x9) {
-        // ping — send pong
-        final pong = Uint8List.fromList([0x8A, 0x00]);
-        _socket?.add(pong);
       }
 
       _frameBuffer.removeRange(0, idx + len);
     }
+
+    _processingFrames = false;
   }
 
   void _onMessage(dynamic message) {
@@ -228,6 +266,12 @@ class WhisperClient {
     _socket?.add(frame);
   }
 
+  void _sendPing() {
+    if (_disposed || _socket == null) return;
+    final ping = Uint8List.fromList([0x89, 0x00]); // FIN + PING, no payload
+    _socket?.add(ping);
+  }
+
   Uint8List _buildFrame(int opcode, List<int> payload) {
     final mask = List<int>.generate(4, (_) => Random().nextInt(256));
     final masked = <int>[];
@@ -245,7 +289,9 @@ class WhisperClient {
       out.add(payload.length & 0xFF);
     } else {
       out.add(0x80 | 127);
-      for (int i = 7; i >= 0; i--) out.add((payload.length >> (8 * i)) & 0xFF);
+      for (int i = 7; i >= 0; i--) {
+        out.add((payload.length >> (8 * i)) & 0xFF);
+      }
     }
     out.addAll(mask);
     out.addAll(masked);
@@ -254,6 +300,8 @@ class WhisperClient {
 
   Future<void> disconnect() async {
     _disposed = true;
+    _pingTimer?.cancel();
+    _pingTimer = null;
     await _subscription?.cancel();
     _subscription = null;
     await _socket?.close();
@@ -273,9 +321,9 @@ class WhisperClient {
       return ConnectionResult(false,
           'Timed out connecting to ${config.host}:${config.port}.');
     } on SocketException catch (e) {
-      return ConnectionResult(false, '${e.message}');
+      return ConnectionResult(false, e.message);
     } on Object catch (e) {
-      return ConnectionResult(false, '$e');
+      return ConnectionResult(false, '${e.runtimeType}: $e');
     }
   }
 }

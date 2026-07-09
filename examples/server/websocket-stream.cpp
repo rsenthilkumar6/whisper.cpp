@@ -21,7 +21,9 @@
 #include "json.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -37,10 +39,18 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <signal.h>
 
 using json = nlohmann::ordered_json;
 
 static const int SAMPLE_RATE = WHISPER_SAMPLE_RATE;  // 16000
+
+// Global state for graceful shutdown
+static std::atomic<bool> g_shutdown{false};
+
+static void signal_handler(int) {
+    g_shutdown.store(true);
+}
 
 // ---------------------------------------------------------------------------
 // Minimal RFC6455 WebSocket server (server-side framing only)
@@ -75,6 +85,10 @@ static bool ws_try_parse_frame(std::vector<uint8_t> & buf, WSFrame & frame) {
         for (int i = 0; i < 8; i++) len = (len << 8) | buf[idx + i];
         idx = 10;
     }
+
+    // Prevent OOM from maliciously large frames
+    static const uint64_t MAX_FRAME_SIZE = 16 * 1024 * 1024; // 16 MB
+    if (len > MAX_FRAME_SIZE) return false;
 
     uint8_t mask[4] = {0, 0, 0, 0};
     if (masked) {
@@ -363,9 +377,11 @@ static void session_processor(Session * s) {
     while (s->alive.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         if (!s->alive.load()) break;
-        if (s->new_samples.load() < Session::min_new_samples) continue;
 
-        s->new_samples.store(0);
+        // Atomic exchange to avoid check-then-act race with reader thread
+        int new_samples = s->new_samples.exchange(0);
+        if (new_samples < Session::min_new_samples) continue;
+
         std::string text = s->run_whisper(false);
         if (!s->alive.load()) break;
         json out;
@@ -407,6 +423,10 @@ static void handle_connection(int fd, struct whisper_context * ctx, const server
 // ---------------------------------------------------------------------------
 
 int main(int argc, char ** argv) {
+    // Set up signal handling for graceful shutdown
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     ggml_backend_load_all();
 
     server_config cfg;
@@ -440,6 +460,10 @@ int main(int argc, char ** argv) {
     }
     fprintf(stderr, "[ws] model loaded, listening on %s:%d\n", cfg.host.c_str(), cfg.port);
 
+    // Set up signal handlers for graceful shutdown
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) { perror("socket"); return 1; }
     int yes = 1;
@@ -457,10 +481,40 @@ int main(int argc, char ** argv) {
         perror("listen"); return 1;
     }
 
-    while (true) {
+    // Set socket to non-blocking so we can check shutdown flag
+    int flags = fcntl(listen_fd, F_GETFL, 0);
+    fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+
+    std::vector<std::thread> client_threads;
+
+    while (!g_shutdown.load()) {
         int client_fd = accept(listen_fd, nullptr, nullptr);
-        if (client_fd < 0) { perror("accept"); continue; }
-        std::thread(handle_connection, client_fd, ctx, &cfg).detach();
+        if (client_fd < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            perror("accept");
+            continue;
+        }
+        client_threads.emplace_back(handle_connection, client_fd, ctx, &cfg);
+
+        // Clean up finished threads
+        for (auto it = client_threads.begin(); it != client_threads.end(); ) {
+            if (it->joinable()) {
+                it->join();
+                it = client_threads.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    fprintf(stderr, "[ws] shutting down...\n");
+
+    // Wait for all client threads to finish
+    for (auto & t : client_threads) {
+        if (t.joinable()) t.join();
     }
 
     whisper_free(ctx);

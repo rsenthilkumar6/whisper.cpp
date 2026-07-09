@@ -10,6 +10,7 @@ import 'services/settings_repository.dart';
 import 'services/tray_service.dart';
 import 'services/window_service.dart';
 import 'state/recording_cubit.dart';
+import 'ui/settings_sheet.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -39,10 +40,11 @@ Future<void> main() async {
   await tray.init(
     onToggle: cubit.toggle,
     onShow: () => window.showIdle(),
-    onSettings: () {
-      window.showSettings();
-      navigatorKey.currentState?.pushNamed('/settings');
-    },
+    onSettings: () => SettingsSheet.show(
+      context: navigatorKey.currentContext!,
+      repository: settings,
+      onSaved: (c) => hotkey.register(c),
+    ),
     onQuit: () {
       window.hide();
       unawaited(hotkey.dispose());

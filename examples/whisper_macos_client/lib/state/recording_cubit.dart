@@ -27,6 +27,9 @@ class RecordingCubit extends Cubit<RecordingState> {
   final TrayService _tray;
   final SettingsRepository _settings;
 
+  /// Expose audio capture for real-time waveform visualization
+  AudioCapture get audioCapture => _audio;
+
   WhisperClient? _client;
   Timer? _hideTimer;
   String _lastInserted = '';

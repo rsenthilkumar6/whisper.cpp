@@ -36,7 +36,6 @@ dependencies:
   cupertino_icons: ^1.0.8
 
   # Local dictation client for the whisper.cpp websocket-stream server.
-  web_socket_channel: ^3.0.3
   record: ^7.1.1
   hotkey_manager: ^0.2.3
   system_tray: ^2.0.3
